@@ -33,7 +33,7 @@ module "rds" {
 
   db_name     = "fastfood"
   db_username = "root"
-  db_password = "1234" # Em produção, usar um secret manager
+  db_password = "12345678" # Em produção, usar um secret manager
 
   vpc_id             = module.networking.vpc_id
   subnet_ids         = module.networking.rds_private_subnet_ids
