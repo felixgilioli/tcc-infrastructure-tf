@@ -32,7 +32,7 @@ module "rds" {
   source = "./modules/rds"
 
   db_name     = "fastfood"
-  db_username = "admin"
+  db_username = "root"
   db_password = "1234" # Em produção, usar um secret manager
 
   vpc_id             = module.networking.vpc_id
