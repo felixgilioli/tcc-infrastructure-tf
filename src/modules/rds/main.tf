@@ -13,7 +13,7 @@ resource "aws_db_subnet_group" "main" {
 
 # Instância do RDS
 resource "aws_db_instance" "main" {
-  identifier            = "postgres"
+  identifier            = "fastfood-rds"
   engine                = "postgres"
   engine_version        = "17.4"
   instance_class        = var.instance_class
@@ -31,6 +31,7 @@ resource "aws_db_instance" "main" {
   backup_retention_period = var.backup_retention_period
   skip_final_snapshot     = var.skip_final_snapshot
 
+  publicly_accessible = true
   storage_encrypted = true
   multi_az          = true
 
