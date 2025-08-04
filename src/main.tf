@@ -36,7 +36,7 @@ module "rds" {
   db_password = "12345678" # Em produção, usar um secret manager
 
   vpc_id             = module.networking.vpc_id
-  subnet_ids         = module.networking.rds_private_subnet_ids
+  subnet_ids         = module.networking.public_subnet_ids
   security_group_ids = [module.networking.rds_security_group_id]
 
   instance_class          = "db.t3.medium"
