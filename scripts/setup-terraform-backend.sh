@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # Configurações
-BUCKET_NAME="iac-terraform-felix"
+BUCKET_NAME="iac-tcc-felix"
 REGION="us-east-1"
-DYNAMODB_TABLE="terraform-locks"
+DYNAMODB_TABLE="tcc-locks"
 
 # Criar bucket S3
 aws s3api create-bucket \
