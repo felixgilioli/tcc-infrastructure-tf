@@ -75,3 +75,4 @@ Essas etapas garantem validação, segurança e aplicação automatizada da infr
 ## Arquitetura Geral
 
 A arquitetura provisionada segue o padrão de microsserviços, com um cluster EKS para orquestração de containers e rede isolada. O acesso é controlado por security groups e roles de IAM, promovendo segurança e boas práticas de DevOps.
+
