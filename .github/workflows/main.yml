@@ -14,7 +14,7 @@ env:
 jobs:
   terraform-scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4.2.2
@@ -106,5 +106,5 @@ jobs:
         working-directory: ./src
         
       - name: Execução do Terraform Apply
+        run: terraform apply --auto-approve
         working-directory: ./src
-        run: terraform apply -input=false -auto-approve tfplan
