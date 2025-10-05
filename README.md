@@ -5,7 +5,6 @@
 Este projeto utiliza o Terraform para provisionar de forma automatizada e segura todos os recursos necessários para a criação de um ambiente completo na AWS. Ele é responsável por:
 
 * Provisionar um cluster Kubernetes gerenciado (EKS);
-* Criar uma instância de banco de dados PostgreSQL utilizando o Amazon RDS;
 * Armazenar o estado do Terraform em um bucket S3, garantindo versionamento e controle de mudanças na infraestrutura.
 
 O objetivo é facilitar a criação, gerenciamento e destruição de ambientes Kubernetes para desenvolvimento, testes ou produção, promovendo consistência e reprodutibilidade na infraestrutura.
@@ -32,17 +31,12 @@ src/
       variables.tf
       outputs.tf
       security_groups.tf
-    rds/                 # Módulo para banco de dados RDS PostgreSQL
-      main.tf
-      variables.tf
-      outputs.tf
 ```
 
 ### Descrição dos Módulos
 
 - **networking**: Cria a VPC, subnets públicas/privadas e security groups necessários para a comunicação segura entre os recursos.
 - **eks**: Provisiona o cluster Kubernetes gerenciado (EKS), incluindo roles e policies de IAM.
-- **rds**: Cria a instância do banco de dados PostgreSQL no Amazon RDS, configurando parâmetros de segurança e acesso.
 
 ### Armazenamento do Estado
 
@@ -80,4 +74,4 @@ Essas etapas garantem validação, segurança e aplicação automatizada da infr
 
 ## Arquitetura Geral
 
-A arquitetura provisionada segue o padrão de microsserviços, com um cluster EKS para orquestração de containers, banco de dados gerenciado e rede isolada. O acesso é controlado por security groups e roles de IAM, promovendo segurança e boas práticas de DevOps.
+A arquitetura provisionada segue o padrão de microsserviços, com um cluster EKS para orquestração de containers e rede isolada. O acesso é controlado por security groups e roles de IAM, promovendo segurança e boas práticas de DevOps.

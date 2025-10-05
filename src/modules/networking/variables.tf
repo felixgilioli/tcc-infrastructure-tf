@@ -13,11 +13,6 @@ variable "eks_private_subnets" {
   type        = list(string)
 }
 
-variable "rds_private_subnets" {
-  description = "CIDR blocks para as subnets privadas do RDS"
-  type        = list(string)
-}
-
 variable "availability_zones" {
   description = "Zonas de disponibilidade para as subnets"
   type        = list(string)

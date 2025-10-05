@@ -7,11 +7,11 @@ terraform {
   }
 
   backend "s3" {
-    bucket         = "iac-terraform-felix"
+    bucket         = "iac-tcc-felix"
     key            = "terraform.tfstate"
     region         = "us-east-1"
     encrypt        = true
-    dynamodb_table = "terraform-locks"
+    dynamodb_table = "tcc-locks"
   }
 }
 
