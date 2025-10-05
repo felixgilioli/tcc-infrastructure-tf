@@ -29,7 +29,7 @@ jobs:
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.7.0"
-          terraform_wrapper: false  # Importante para capturar outputs
+          terraform_wrapper: false
 
       - name: Terraform Init
         run: terraform init
@@ -37,30 +37,43 @@ jobs:
 
       # ========== DESCOBRIR VPC_ID ==========
 
-      - name: 🔍 Descobrir VPC_ID do Terraform
+      - name: 🔍 Descobrir VPC_ID do Terraform State
         id: get_vpc
         run: |
-          echo "Tentando extrair VPC_ID do Terraform..."
+          echo "Buscando VPC_ID do Terraform State..."
           
-          # Método 1: Terraform Output
-          VPC_ID=$(terraform output -raw vpc_id 2>/dev/null || echo "")
+          # Listar recursos VPC
+          echo "Listando recursos do state:"
+          terraform state list
           
-          # Método 2: Se não funcionar, tentar do state
-          if [ -z "$VPC_ID" ] || [ "$VPC_ID" == "null" ]; then
-            echo "Output não encontrado, tentando extrair do state..."
-            VPC_ID=$(terraform state show 'module.networking.aws_vpc.main' 2>/dev/null | grep -E '^\s*id\s*=' | awk '{print $3}' | tr -d '"' || echo "")
-          fi
+          # Encontrar o recurso VPC
+          VPC_RESOURCE=$(terraform state list | grep -E 'aws_vpc\.' | head -1)
           
-          # Método 3: Listar do state todos os recursos VPC
-          if [ -z "$VPC_ID" ] || [ "$VPC_ID" == "null" ]; then
-            echo "Tentando listar VPCs do state..."
-            VPC_ID=$(terraform state list | grep 'aws_vpc' | head -1 | xargs -I {} terraform state show {} 2>/dev/null | grep -E '^\s*id\s*=' | awk '{print $3}' | tr -d '"' || echo "")
-          fi
-          
-          if [ -z "$VPC_ID" ] || [ "$VPC_ID" == "null" ]; then
-            echo "❌ ERRO: Não foi possível encontrar VPC_ID"
-            echo "Listando recursos do state para debug:"
+          if [ -z "$VPC_RESOURCE" ]; then
+            echo "❌ ERRO: Nenhum recurso aws_vpc encontrado no state"
+            echo "Recursos disponíveis:"
             terraform state list
+            exit 1
+          fi
+          
+          echo "Recurso VPC encontrado: $VPC_RESOURCE"
+          
+          # Extrair VPC_ID do recurso
+          VPC_ID=$(terraform state show "$VPC_RESOURCE" 2>/dev/null | grep -E '^\s*id\s*=' | head -1 | sed 's/.*=\s*"\(.*\)"/\1/' | tr -d ' ')
+          
+          # Validar se é um VPC ID válido (formato: vpc-XXXXXXXXXXXXXXXXX)
+          if [[ ! "$VPC_ID" =~ ^vpc-[a-f0-9]{17}$ ]] && [[ ! "$VPC_ID" =~ ^vpc-[a-f0-9]{8}$ ]]; then
+            echo "❌ ERRO: VPC_ID inválido capturado: '$VPC_ID'"
+            echo "Tentando método alternativo..."
+          
+            # Método alternativo: extrair JSON e pegar o id
+            VPC_ID=$(terraform show -json 2>/dev/null | jq -r '.values.root_module.resources[]? | select(.type=="aws_vpc") | .values.id' | head -1)
+          fi
+          
+          # Validar novamente
+          if [[ ! "$VPC_ID" =~ ^vpc-[a-f0-9]{17}$ ]] && [[ ! "$VPC_ID" =~ ^vpc-[a-f0-9]{8}$ ]]; then
+            echo "❌ ERRO: Não foi possível extrair VPC_ID válido"
+            echo "VPC_ID capturado: '$VPC_ID'"
             exit 1
           fi
           
@@ -80,31 +93,25 @@ jobs:
           echo -e "\n=== Load Balancers ==="
           aws elbv2 describe-load-balancers \
             --query "LoadBalancers[?VpcId=='$VPC_ID'].[LoadBalancerName,LoadBalancerArn,State.Code]" \
-            --output table || echo "Nenhum LB encontrado"
+            --output table 2>/dev/null || echo "Nenhum LB encontrado"
           
           echo -e "\n=== NAT Gateways ==="
           aws ec2 describe-nat-gateways \
             --filter "Name=vpc-id,Values=$VPC_ID" \
             --query 'NatGateways[*].[NatGatewayId,State,SubnetId]' \
-            --output table || echo "Nenhum NAT encontrado"
+            --output table 2>/dev/null || echo "Nenhum NAT encontrado"
           
           echo -e "\n=== Elastic IPs ==="
           aws ec2 describe-addresses \
             --filters "Name=domain,Values=vpc" \
             --query 'Addresses[*].[PublicIp,AllocationId,AssociationId]' \
-            --output table || echo "Nenhum EIP encontrado"
+            --output table 2>/dev/null || echo "Nenhum EIP encontrado"
           
           echo -e "\n=== Network Interfaces ==="
           aws ec2 describe-network-interfaces \
             --filters "Name=vpc-id,Values=$VPC_ID" \
             --query 'NetworkInterfaces[*].[NetworkInterfaceId,Status,Description]' \
-            --output table || echo "Nenhum ENI encontrado"
-          
-          echo -e "\n=== Security Groups ==="
-          aws ec2 describe-security-groups \
-            --filters "Name=vpc-id,Values=$VPC_ID" \
-            --query 'SecurityGroups[*].[GroupId,GroupName]' \
-            --output table || echo "Nenhum SG encontrado"
+            --output table 2>/dev/null || echo "Nenhum ENI encontrado"
         continue-on-error: true
 
       - name: 🔥 1/5 - Deletar Load Balancers
@@ -114,12 +121,12 @@ jobs:
           
           LBS=$(aws elbv2 describe-load-balancers \
             --query "LoadBalancers[?VpcId=='$VPC_ID'].LoadBalancerArn" \
-            --output text)
+            --output text 2>/dev/null || echo "")
           
-          if [ -n "$LBS" ]; then
+          if [ -n "$LBS" ] && [ "$LBS" != "None" ]; then
             for lb in $LBS; do
               echo "  ➜ Deletando LB: $lb"
-              aws elbv2 delete-load-balancer --load-balancer-arn $lb || true
+              aws elbv2 delete-load-balancer --load-balancer-arn $lb 2>/dev/null || true
             done
             echo "✅ Load Balancers deletados. Aguardando 60s..."
             sleep 60
@@ -136,12 +143,12 @@ jobs:
           NATS=$(aws ec2 describe-nat-gateways \
             --filter "Name=vpc-id,Values=$VPC_ID" "Name=state,Values=available,pending" \
             --query 'NatGateways[*].NatGatewayId' \
-            --output text)
+            --output text 2>/dev/null || echo "")
           
-          if [ -n "$NATS" ]; then
+          if [ -n "$NATS" ] && [ "$NATS" != "None" ]; then
             for nat in $NATS; do
               echo "  ➜ Deletando NAT: $nat"
-              aws ec2 delete-nat-gateway --nat-gateway-id $nat || true
+              aws ec2 delete-nat-gateway --nat-gateway-id $nat 2>/dev/null || true
             done
             echo "✅ NAT Gateways deletados. Aguardando 120s para liberação completa..."
             sleep 120
@@ -157,9 +164,9 @@ jobs:
           EIPS=$(aws ec2 describe-addresses \
             --filters "Name=domain,Values=vpc" \
             --query 'Addresses[*].AllocationId' \
-            --output text)
+            --output text 2>/dev/null || echo "")
           
-          if [ -n "$EIPS" ]; then
+          if [ -n "$EIPS" ] && [ "$EIPS" != "None" ]; then
             for eip in $EIPS; do
               echo "  ➜ Liberando EIP: $eip"
           
@@ -167,15 +174,15 @@ jobs:
               ASSOC_ID=$(aws ec2 describe-addresses \
                 --allocation-ids $eip \
                 --query 'Addresses[0].AssociationId' \
-                --output text 2>/dev/null)
+                --output text 2>/dev/null || echo "")
           
-              if [ "$ASSOC_ID" != "None" ] && [ -n "$ASSOC_ID" ]; then
-                aws ec2 disassociate-address --association-id $ASSOC_ID || true
+              if [ -n "$ASSOC_ID" ] && [ "$ASSOC_ID" != "None" ] && [ "$ASSOC_ID" != "null" ]; then
+                aws ec2 disassociate-address --association-id $ASSOC_ID 2>/dev/null || true
                 sleep 5
               fi
           
               # Depois libera
-              aws ec2 release-address --allocation-id $eip || true
+              aws ec2 release-address --allocation-id $eip 2>/dev/null || true
             done
             echo "✅ Elastic IPs liberados"
           else
@@ -191,9 +198,9 @@ jobs:
           ENIS=$(aws ec2 describe-network-interfaces \
             --filters "Name=vpc-id,Values=$VPC_ID" \
             --query 'NetworkInterfaces[*].NetworkInterfaceId' \
-            --output text)
+            --output text 2>/dev/null || echo "")
           
-          if [ -n "$ENIS" ]; then
+          if [ -n "$ENIS" ] && [ "$ENIS" != "None" ]; then
             for eni in $ENIS; do
               echo "  ➜ Processando ENI: $eni"
           
@@ -201,9 +208,9 @@ jobs:
               ATTACH_ID=$(aws ec2 describe-network-interfaces \
                 --network-interface-ids $eni \
                 --query 'NetworkInterfaces[0].Attachment.AttachmentId' \
-                --output text 2>/dev/null)
+                --output text 2>/dev/null || echo "")
           
-              if [ "$ATTACH_ID" != "None" ] && [ -n "$ATTACH_ID" ]; then
+              if [ -n "$ATTACH_ID" ] && [ "$ATTACH_ID" != "None" ] && [ "$ATTACH_ID" != "null" ]; then
                 echo "    ↳ Desanexando..."
                 aws ec2 detach-network-interface \
                   --attachment-id $ATTACH_ID \
@@ -228,11 +235,17 @@ jobs:
           VPC_ID="${{ steps.get_vpc.outputs.VPC_ID }}"
           echo "Limpando Security Groups órfãos da VPC $VPC_ID..."
           
-          aws ec2 describe-security-groups \
+          SGS=$(aws ec2 describe-security-groups \
             --filters "Name=vpc-id,Values=$VPC_ID" \
             --query 'SecurityGroups[?GroupName!=`default`].GroupId' \
-            --output text | xargs -r -n1 aws ec2 delete-security-group \
-            --group-id 2>/dev/null || true
+            --output text 2>/dev/null || echo "")
+          
+          if [ -n "$SGS" ] && [ "$SGS" != "None" ]; then
+            for sg in $SGS; do
+              echo "  ➜ Deletando SG: $sg"
+              aws ec2 delete-security-group --group-id $sg 2>/dev/null || true
+            done
+          fi
           
           echo "✅ Security Groups processados"
         continue-on-error: true
