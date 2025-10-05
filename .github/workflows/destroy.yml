@@ -29,34 +29,232 @@ jobs:
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.7.0"
+          terraform_wrapper: false  # Importante para capturar outputs
 
       - name: Terraform Init
         run: terraform init
         working-directory: ./src
 
-      - name: Install kubectl
-        run: |
-          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-          chmod +x kubectl
-          sudo mv kubectl /usr/local/bin/
+      # ========== DESCOBRIR VPC_ID ==========
 
-      - name: Configure kubectl for EKS
+      - name: 🔍 Descobrir VPC_ID do Terraform
+        id: get_vpc
         run: |
-          aws eks update-kubeconfig --name tcc-eks-cluster --region ${{ secrets.AWS_REGION }}
+          echo "Tentando extrair VPC_ID do Terraform..."
+          
+          # Método 1: Terraform Output
+          VPC_ID=$(terraform output -raw vpc_id 2>/dev/null || echo "")
+          
+          # Método 2: Se não funcionar, tentar do state
+          if [ -z "$VPC_ID" ] || [ "$VPC_ID" == "null" ]; then
+            echo "Output não encontrado, tentando extrair do state..."
+            VPC_ID=$(terraform state show 'module.networking.aws_vpc.main' 2>/dev/null | grep -E '^\s*id\s*=' | awk '{print $3}' | tr -d '"' || echo "")
+          fi
+          
+          # Método 3: Listar do state todos os recursos VPC
+          if [ -z "$VPC_ID" ] || [ "$VPC_ID" == "null" ]; then
+            echo "Tentando listar VPCs do state..."
+            VPC_ID=$(terraform state list | grep 'aws_vpc' | head -1 | xargs -I {} terraform state show {} 2>/dev/null | grep -E '^\s*id\s*=' | awk '{print $3}' | tr -d '"' || echo "")
+          fi
+          
+          if [ -z "$VPC_ID" ] || [ "$VPC_ID" == "null" ]; then
+            echo "❌ ERRO: Não foi possível encontrar VPC_ID"
+            echo "Listando recursos do state para debug:"
+            terraform state list
+            exit 1
+          fi
+          
+          echo "✅ VPC_ID encontrado: $VPC_ID"
+          echo "VPC_ID=$VPC_ID" >> $GITHUB_OUTPUT
+        working-directory: ./src
+
+      # ========== LIMPEZA FORÇADA DE RECURSOS AWS ==========
+
+      - name: 🔍 Diagnóstico - Listar recursos presos
+        run: |
+          VPC_ID="${{ steps.get_vpc.outputs.VPC_ID }}"
+          echo "============================================"
+          echo "📋 DIAGNÓSTICO DE RECURSOS NA VPC: $VPC_ID"
+          echo "============================================"
+          
+          echo -e "\n=== Load Balancers ==="
+          aws elbv2 describe-load-balancers \
+            --query "LoadBalancers[?VpcId=='$VPC_ID'].[LoadBalancerName,LoadBalancerArn,State.Code]" \
+            --output table || echo "Nenhum LB encontrado"
+          
+          echo -e "\n=== NAT Gateways ==="
+          aws ec2 describe-nat-gateways \
+            --filter "Name=vpc-id,Values=$VPC_ID" \
+            --query 'NatGateways[*].[NatGatewayId,State,SubnetId]' \
+            --output table || echo "Nenhum NAT encontrado"
+          
+          echo -e "\n=== Elastic IPs ==="
+          aws ec2 describe-addresses \
+            --filters "Name=domain,Values=vpc" \
+            --query 'Addresses[*].[PublicIp,AllocationId,AssociationId]' \
+            --output table || echo "Nenhum EIP encontrado"
+          
+          echo -e "\n=== Network Interfaces ==="
+          aws ec2 describe-network-interfaces \
+            --filters "Name=vpc-id,Values=$VPC_ID" \
+            --query 'NetworkInterfaces[*].[NetworkInterfaceId,Status,Description]' \
+            --output table || echo "Nenhum ENI encontrado"
+          
+          echo -e "\n=== Security Groups ==="
+          aws ec2 describe-security-groups \
+            --filters "Name=vpc-id,Values=$VPC_ID" \
+            --query 'SecurityGroups[*].[GroupId,GroupName]' \
+            --output table || echo "Nenhum SG encontrado"
         continue-on-error: true
 
-      - name: Delete all LoadBalancer Services
+      - name: 🔥 1/5 - Deletar Load Balancers
         run: |
-          kubectl delete svc --all-namespaces --field-selector spec.type=LoadBalancer --ignore-not-found=true
-          sleep 60
+          VPC_ID="${{ steps.get_vpc.outputs.VPC_ID }}"
+          echo "Deletando Load Balancers da VPC $VPC_ID..."
+          
+          LBS=$(aws elbv2 describe-load-balancers \
+            --query "LoadBalancers[?VpcId=='$VPC_ID'].LoadBalancerArn" \
+            --output text)
+          
+          if [ -n "$LBS" ]; then
+            for lb in $LBS; do
+              echo "  ➜ Deletando LB: $lb"
+              aws elbv2 delete-load-balancer --load-balancer-arn $lb || true
+            done
+            echo "✅ Load Balancers deletados. Aguardando 60s..."
+            sleep 60
+          else
+            echo "✅ Nenhum Load Balancer encontrado"
+          fi
         continue-on-error: true
 
-      - name: Delete all Ingresses
+      - name: 🔥 2/5 - Deletar NAT Gateways
         run: |
-          kubectl delete ingress --all --all-namespaces --ignore-not-found=true
-          sleep 30
+          VPC_ID="${{ steps.get_vpc.outputs.VPC_ID }}"
+          echo "Deletando NAT Gateways da VPC $VPC_ID..."
+          
+          NATS=$(aws ec2 describe-nat-gateways \
+            --filter "Name=vpc-id,Values=$VPC_ID" "Name=state,Values=available,pending" \
+            --query 'NatGateways[*].NatGatewayId' \
+            --output text)
+          
+          if [ -n "$NATS" ]; then
+            for nat in $NATS; do
+              echo "  ➜ Deletando NAT: $nat"
+              aws ec2 delete-nat-gateway --nat-gateway-id $nat || true
+            done
+            echo "✅ NAT Gateways deletados. Aguardando 120s para liberação completa..."
+            sleep 120
+          else
+            echo "✅ Nenhum NAT Gateway encontrado"
+          fi
         continue-on-error: true
 
-      - name: Terraform Destroy
+      - name: 🔥 3/5 - Liberar Elastic IPs
+        run: |
+          echo "Liberando Elastic IPs..."
+          
+          EIPS=$(aws ec2 describe-addresses \
+            --filters "Name=domain,Values=vpc" \
+            --query 'Addresses[*].AllocationId' \
+            --output text)
+          
+          if [ -n "$EIPS" ]; then
+            for eip in $EIPS; do
+              echo "  ➜ Liberando EIP: $eip"
+          
+              # Tenta desassociar primeiro
+              ASSOC_ID=$(aws ec2 describe-addresses \
+                --allocation-ids $eip \
+                --query 'Addresses[0].AssociationId' \
+                --output text 2>/dev/null)
+          
+              if [ "$ASSOC_ID" != "None" ] && [ -n "$ASSOC_ID" ]; then
+                aws ec2 disassociate-address --association-id $ASSOC_ID || true
+                sleep 5
+              fi
+          
+              # Depois libera
+              aws ec2 release-address --allocation-id $eip || true
+            done
+            echo "✅ Elastic IPs liberados"
+          else
+            echo "✅ Nenhum Elastic IP encontrado"
+          fi
+        continue-on-error: true
+
+      - name: 🔥 4/5 - Deletar Network Interfaces
+        run: |
+          VPC_ID="${{ steps.get_vpc.outputs.VPC_ID }}"
+          echo "Deletando Network Interfaces da VPC $VPC_ID..."
+          
+          ENIS=$(aws ec2 describe-network-interfaces \
+            --filters "Name=vpc-id,Values=$VPC_ID" \
+            --query 'NetworkInterfaces[*].NetworkInterfaceId' \
+            --output text)
+          
+          if [ -n "$ENIS" ]; then
+            for eni in $ENIS; do
+              echo "  ➜ Processando ENI: $eni"
+          
+              # Tenta desanexar se estiver anexado
+              ATTACH_ID=$(aws ec2 describe-network-interfaces \
+                --network-interface-ids $eni \
+                --query 'NetworkInterfaces[0].Attachment.AttachmentId' \
+                --output text 2>/dev/null)
+          
+              if [ "$ATTACH_ID" != "None" ] && [ -n "$ATTACH_ID" ]; then
+                echo "    ↳ Desanexando..."
+                aws ec2 detach-network-interface \
+                  --attachment-id $ATTACH_ID \
+                  --force 2>/dev/null || true
+                sleep 5
+              fi
+          
+              # Deleta o ENI
+              echo "    ↳ Deletando..."
+              aws ec2 delete-network-interface \
+                --network-interface-id $eni 2>/dev/null || true
+            done
+            echo "✅ Network Interfaces processados. Aguardando 30s..."
+            sleep 30
+          else
+            echo "✅ Nenhum Network Interface encontrado"
+          fi
+        continue-on-error: true
+
+      - name: 🔥 5/5 - Limpeza de Security Groups órfãos
+        run: |
+          VPC_ID="${{ steps.get_vpc.outputs.VPC_ID }}"
+          echo "Limpando Security Groups órfãos da VPC $VPC_ID..."
+          
+          aws ec2 describe-security-groups \
+            --filters "Name=vpc-id,Values=$VPC_ID" \
+            --query 'SecurityGroups[?GroupName!=`default`].GroupId' \
+            --output text | xargs -r -n1 aws ec2 delete-security-group \
+            --group-id 2>/dev/null || true
+          
+          echo "✅ Security Groups processados"
+        continue-on-error: true
+
+      # ========== TERRAFORM DESTROY ==========
+
+      - name: 🎯 Terraform Destroy - Tentativa 1
         run: terraform destroy -parallelism=1 --auto-approve
         working-directory: ./src
+        continue-on-error: true
+
+      - name: ⏳ Aguardar propagação AWS
+        run: |
+          echo "Aguardando 60s para propagação de mudanças na AWS..."
+          sleep 60
+
+      - name: 🎯 Terraform Destroy - Tentativa 2 (Final)
+        run: terraform destroy -parallelism=1 --auto-approve
+        working-directory: ./src
+
+      - name: ✅ Destroy concluído com sucesso
+        run: |
+          echo "============================================"
+          echo "✅ DESTROY CONCLUÍDO COM SUCESSO!"
+          echo "============================================"
