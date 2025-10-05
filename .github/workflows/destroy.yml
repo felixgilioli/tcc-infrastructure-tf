@@ -1,7 +1,7 @@
-name: IaC Pipeline
+name: IaC Pipeline - EKS Destroy
 
-on: 
-  push: 
+on:
+  push:
     branches:
       - destroy
   workflow_dispatch:
@@ -12,21 +12,51 @@ env:
   AWS_REGION: ${{ secrets.AWS_REGION }}
 
 jobs:
-  terraform-scan:
+  terraform-destroy:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4.2.2
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.7.0"
 
-      - name: Execução do Terraform Init
-        run: terraform init 
+      - name: Terraform Init
+        run: terraform init
         working-directory: ./src
 
-      - name: Execução do Terraform Destroy
-        run: terraform destroy --auto-approve
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      - name: Configure kubectl for EKS
+        run: |
+          aws eks update-kubeconfig --name tcc-eks-cluster --region ${{ secrets.AWS_REGION }}
+        continue-on-error: true
+
+      - name: Delete all LoadBalancer Services
+        run: |
+          kubectl delete svc --all-namespaces --field-selector spec.type=LoadBalancer --ignore-not-found=true
+          sleep 60
+        continue-on-error: true
+
+      - name: Delete all Ingresses
+        run: |
+          kubectl delete ingress --all --all-namespaces --ignore-not-found=true
+          sleep 30
+        continue-on-error: true
+
+      - name: Terraform Destroy
+        run: terraform destroy -parallelism=1 --auto-approve
         working-directory: ./src
