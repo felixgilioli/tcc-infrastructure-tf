@@ -24,16 +24,30 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: us-east-1
 
+      - name: Check if Cluster Exists
+        id: check_cluster
+        run: |
+          if aws eks describe-cluster --name ${{ env.CLUSTER_NAME }} --region us-east-1 &>/dev/null; then
+            echo "cluster_exists=true" >> $GITHUB_OUTPUT
+            echo "✅ Cluster encontrado: ${{ env.CLUSTER_NAME }}"
+          else
+            echo "cluster_exists=false" >> $GITHUB_OUTPUT
+            echo "⚠️ Cluster não encontrado. Pulando limpeza do Kubernetes..."
+          fi
+
       - name: Install kubectl
+        if: steps.check_cluster.outputs.cluster_exists == 'true'
         uses: azure/setup-kubectl@v4
         with:
           version: 'v1.31.0'
 
       - name: Configure kubectl
+        if: steps.check_cluster.outputs.cluster_exists == 'true'
         run: |
           aws eks update-kubeconfig --name ${{ env.CLUSTER_NAME }} --region us-east-1
 
       - name: Delete Kubernetes Resources
+        if: steps.check_cluster.outputs.cluster_exists == 'true'
         run: |
           echo "🗑️ Deletando recursos do Kubernetes..."
           
@@ -88,38 +102,80 @@ jobs:
         run: |
           echo "🧹 Limpando recursos órfãos da AWS..."
           
-          # Deletar Load Balancers com tag do cluster
-          echo "Verificando Load Balancers órfãos..."
+          # Obter VPC ID do cluster (se ainda existir)
+          VPC_ID=$(aws ec2 describe-vpcs --region us-east-1 \
+            --filters "Name=tag:Name,Values=*tcc*" \
+            --query "Vpcs[0].VpcId" --output text 2>/dev/null || echo "")
+          
+          if [ "$VPC_ID" != "None" ] && [ ! -z "$VPC_ID" ]; then
+            echo "VPC encontrada: $VPC_ID"
+          
+            # Deletar Load Balancers na VPC
+            echo "Verificando Load Balancers..."
+            aws elbv2 describe-load-balancers --region us-east-1 --output json | \
+              jq -r --arg vpc "$VPC_ID" '.LoadBalancers[] | select(.VpcId==$vpc) | .LoadBalancerArn' | \
+              while read lb_arn; do
+                if [ ! -z "$lb_arn" ]; then
+                  echo "Deletando Load Balancer: $lb_arn"
+                  aws elbv2 delete-load-balancer --load-balancer-arn $lb_arn --region us-east-1 || true
+                fi
+              done
+          
+            sleep 30
+          
+            # Deletar Target Groups órfãos
+            echo "Verificando Target Groups..."
+            aws elbv2 describe-target-groups --region us-east-1 --output json | \
+              jq -r --arg vpc "$VPC_ID" '.TargetGroups[] | select(.VpcId==$vpc) | .TargetGroupArn' | \
+              while read tg_arn; do
+                if [ ! -z "$tg_arn" ]; then
+                  echo "Deletando Target Group: $tg_arn"
+                  aws elbv2 delete-target-group --target-group-arn $tg_arn --region us-east-1 || true
+                fi
+              done
+          
+            sleep 30
+          
+            # Deletar Network Interfaces órfãs
+            echo "Verificando ENIs (Network Interfaces) órfãs..."
+            aws ec2 describe-network-interfaces --region us-east-1 \
+              --filters "Name=vpc-id,Values=$VPC_ID" "Name=status,Values=available" \
+              --query "NetworkInterfaces[*].NetworkInterfaceId" --output text | tr '\t' '\n' | \
+              while read eni_id; do
+                if [ ! -z "$eni_id" ]; then
+                  echo "Deletando ENI: $eni_id"
+                  aws ec2 delete-network-interface --network-interface-id $eni_id --region us-east-1 || true
+                fi
+              done
+          
+            sleep 30
+          
+            # Deletar Security Groups órfãos (exceto default)
+            echo "Verificando Security Groups órfãos..."
+            aws ec2 describe-security-groups --region us-east-1 \
+              --filters "Name=vpc-id,Values=$VPC_ID" \
+              --query "SecurityGroups[?GroupName!='default'].GroupId" --output text | tr '\t' '\n' | \
+              while read sg_id; do
+                if [ ! -z "$sg_id" ]; then
+                  echo "Deletando Security Group: $sg_id"
+                  aws ec2 delete-security-group --group-id $sg_id --region us-east-1 || true
+                fi
+              done
+          else
+            echo "VPC não encontrada ou já deletada."
+          fi
+          
+          # Buscar por recursos com tag do cluster
+          echo "Buscando recursos com tag do cluster..."
+          
+          # Load Balancers com tag
           aws elbv2 describe-load-balancers --region us-east-1 --query "LoadBalancers[*].LoadBalancerArn" --output text | tr '\t' '\n' | while read lb_arn; do
             if [ ! -z "$lb_arn" ]; then
-              tags=$(aws elbv2 describe-tags --resource-arns $lb_arn --region us-east-1 --query "TagDescriptions[0].Tags[?Key=='kubernetes.io/cluster/${{ env.CLUSTER_NAME }}'].Value" --output text)
+              tags=$(aws elbv2 describe-tags --resource-arns $lb_arn --region us-east-1 --query "TagDescriptions[0].Tags[?Key=='kubernetes.io/cluster/${{ env.CLUSTER_NAME }}'].Value" --output text 2>/dev/null || echo "")
               if [ ! -z "$tags" ]; then
-                echo "Deletando Load Balancer: $lb_arn"
+                echo "Deletando Load Balancer com tag: $lb_arn"
                 aws elbv2 delete-load-balancer --load-balancer-arn $lb_arn --region us-east-1 || true
               fi
-            fi
-          done
-          
-          # Deletar Target Groups órfãos
-          echo "Verificando Target Groups órfãos..."
-          aws elbv2 describe-target-groups --region us-east-1 --query "TargetGroups[*].TargetGroupArn" --output text | tr '\t' '\n' | while read tg_arn; do
-            if [ ! -z "$tg_arn" ]; then
-              tags=$(aws elbv2 describe-tags --resource-arns $tg_arn --region us-east-1 --query "TagDescriptions[0].Tags[?Key=='kubernetes.io/cluster/${{ env.CLUSTER_NAME }}'].Value" --output text 2>/dev/null || echo "")
-              if [ ! -z "$tags" ]; then
-                echo "Deletando Target Group: $tg_arn"
-                aws elbv2 delete-target-group --target-group-arn $tg_arn --region us-east-1 || true
-              fi
-            fi
-          done
-          
-          # Deletar Security Groups órfãos (criados pelo Kubernetes)
-          echo "Verificando Security Groups órfãos..."
-          aws ec2 describe-security-groups --region us-east-1 \
-            --filters "Name=tag:kubernetes.io/cluster/${{ env.CLUSTER_NAME }},Values=owned" \
-            --query "SecurityGroups[*].GroupId" --output text | tr '\t' '\n' | while read sg_id; do
-            if [ ! -z "$sg_id" ]; then
-              echo "Deletando Security Group: $sg_id"
-              aws ec2 delete-security-group --group-id $sg_id --region us-east-1 || true
             fi
           done
           
@@ -128,8 +184,8 @@ jobs:
 
       - name: Final Wait
         run: |
-          echo "⏳ Aguardando 90 segundos adicionais para propagação completa..."
-          sleep 90
+          echo "⏳ Aguardando 60 segundos para propagação completa..."
+          sleep 60
 
   terraform-destroy:
     runs-on: ubuntu-latest
@@ -151,10 +207,20 @@ jobs:
       - name: Terraform Destroy
         run: terraform destroy --auto-approve
         working-directory: ./src
+        continue-on-error: true
+
+      - name: Retry Terraform Destroy (se falhou)
+        if: failure()
+        run: |
+          echo "⚠️ Primeira tentativa falhou. Aguardando 60s e tentando novamente..."
+          sleep 60
+          terraform destroy --auto-approve
+        working-directory: ./src
 
       - name: Cleanup Summary
+        if: always()
         run: |
-          echo "### 🎉 Cluster EKS Deletado com Sucesso!" >> $GITHUB_STEP_SUMMARY
+          echo "### 🎉 Processo de Deleção Concluído!" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "- ✅ Recursos do Kubernetes limpos" >> $GITHUB_STEP_SUMMARY
           echo "- ✅ Load Balancers e recursos AWS órfãos removidos" >> $GITHUB_STEP_SUMMARY
