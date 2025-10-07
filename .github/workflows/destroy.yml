@@ -1,9 +1,6 @@
 name: Delete EKS Cluster
 
 on:
-  push:
-    branches:
-      - destroy
   workflow_dispatch:
 
 env:
@@ -40,11 +37,32 @@ jobs:
         run: |
           echo "🗑️ Deletando recursos do Kubernetes..."
           
-          # 1. Deletar HPAs (para evitar recriação de pods)
+          # 1. Deletar HPAs
           echo "Deletando HPAs..."
           kubectl delete hpa --all --all-namespaces --ignore-not-found=true --timeout=2m || true
           
-          # 2. Deletar Deployments, StatefulSets e DaemonSets
+          # 2. Deletar Ingresses (podem criar ALBs)
+          echo "Deletando Ingresses..."
+          kubectl delete ingress --all --all-namespaces --ignore-not-found=true --timeout=5m || true
+          
+          # 3. CRÍTICO: Deletar Services do tipo LoadBalancer primeiro
+          echo "Deletando Services do tipo LoadBalancer..."
+          kubectl get svc --all-namespaces -o json | \
+            jq -r '.items[] | select(.spec.type=="LoadBalancer") | "\(.metadata.namespace) \(.metadata.name)"' | \
+            while read namespace name; do
+              echo "Deletando Service $name no namespace $namespace"
+              kubectl delete svc $name -n $namespace --timeout=5m || true
+            done
+          
+          # 4. Aguardar Load Balancers serem removidos
+          echo "⏳ Aguardando 120 segundos para Load Balancers serem removidos da AWS..."
+          sleep 120
+          
+          # 5. Deletar outros Services
+          echo "Deletando demais Services..."
+          kubectl delete services --all --all-namespaces --ignore-not-found=true --timeout=3m || true
+          
+          # 6. Deletar Deployments, StatefulSets e DaemonSets
           echo "Deletando Deployments..."
           kubectl delete deployments --all --all-namespaces --ignore-not-found=true --timeout=5m || true
           
@@ -54,29 +72,64 @@ jobs:
           echo "Deletando DaemonSets..."
           kubectl delete daemonsets --all --all-namespaces --ignore-not-found=true --timeout=3m || true
           
-          # 3. Deletar Services (LoadBalancers precisam ser deletados para liberar ELBs na AWS)
-          echo "Deletando Services..."
-          kubectl delete services --all --all-namespaces --ignore-not-found=true --timeout=5m || true
-          
-          # 4. Deletar PVCs (para liberar EBS volumes)
+          # 7. Deletar PVCs
           echo "Deletando PVCs..."
           kubectl delete pvc --all --all-namespaces --ignore-not-found=true --timeout=5m || true
           
-          # 5. Deletar outros recursos comuns
-          echo "Deletando Ingresses..."
-          kubectl delete ingress --all --all-namespaces --ignore-not-found=true --timeout=3m || true
-          
+          # 8. Deletar ConfigMaps e Secrets
           echo "Deletando ConfigMaps e Secrets (exceto kube-system)..."
           kubectl delete configmaps --all --all-namespaces --ignore-not-found=true --field-selector metadata.namespace!=kube-system --timeout=2m || true
           kubectl delete secrets --all --all-namespaces --ignore-not-found=true --field-selector metadata.namespace!=kube-system --timeout=2m || true
           
-          echo "✅ Recursos do Kubernetes deletados com sucesso!"
+          echo "✅ Recursos do Kubernetes deletados!"
         continue-on-error: true
 
-      - name: Wait for AWS Resources Cleanup
+      - name: Cleanup AWS Orphaned Resources
         run: |
-          echo "⏳ Aguardando 60 segundos para garantir que recursos AWS foram liberados..."
-          sleep 60
+          echo "🧹 Limpando recursos órfãos da AWS..."
+          
+          # Deletar Load Balancers com tag do cluster
+          echo "Verificando Load Balancers órfãos..."
+          aws elbv2 describe-load-balancers --region us-east-1 --query "LoadBalancers[*].LoadBalancerArn" --output text | tr '\t' '\n' | while read lb_arn; do
+            if [ ! -z "$lb_arn" ]; then
+              tags=$(aws elbv2 describe-tags --resource-arns $lb_arn --region us-east-1 --query "TagDescriptions[0].Tags[?Key=='kubernetes.io/cluster/${{ env.CLUSTER_NAME }}'].Value" --output text)
+              if [ ! -z "$tags" ]; then
+                echo "Deletando Load Balancer: $lb_arn"
+                aws elbv2 delete-load-balancer --load-balancer-arn $lb_arn --region us-east-1 || true
+              fi
+            fi
+          done
+          
+          # Deletar Target Groups órfãos
+          echo "Verificando Target Groups órfãos..."
+          aws elbv2 describe-target-groups --region us-east-1 --query "TargetGroups[*].TargetGroupArn" --output text | tr '\t' '\n' | while read tg_arn; do
+            if [ ! -z "$tg_arn" ]; then
+              tags=$(aws elbv2 describe-tags --resource-arns $tg_arn --region us-east-1 --query "TagDescriptions[0].Tags[?Key=='kubernetes.io/cluster/${{ env.CLUSTER_NAME }}'].Value" --output text 2>/dev/null || echo "")
+              if [ ! -z "$tags" ]; then
+                echo "Deletando Target Group: $tg_arn"
+                aws elbv2 delete-target-group --target-group-arn $tg_arn --region us-east-1 || true
+              fi
+            fi
+          done
+          
+          # Deletar Security Groups órfãos (criados pelo Kubernetes)
+          echo "Verificando Security Groups órfãos..."
+          aws ec2 describe-security-groups --region us-east-1 \
+            --filters "Name=tag:kubernetes.io/cluster/${{ env.CLUSTER_NAME }},Values=owned" \
+            --query "SecurityGroups[*].GroupId" --output text | tr '\t' '\n' | while read sg_id; do
+            if [ ! -z "$sg_id" ]; then
+              echo "Deletando Security Group: $sg_id"
+              aws ec2 delete-security-group --group-id $sg_id --region us-east-1 || true
+            fi
+          done
+          
+          echo "✅ Limpeza de recursos órfãos concluída!"
+        continue-on-error: true
+
+      - name: Final Wait
+        run: |
+          echo "⏳ Aguardando 90 segundos adicionais para propagação completa..."
+          sleep 90
 
   terraform-destroy:
     runs-on: ubuntu-latest
@@ -104,5 +157,6 @@ jobs:
           echo "### 🎉 Cluster EKS Deletado com Sucesso!" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "- ✅ Recursos do Kubernetes limpos" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Load Balancers e recursos AWS órfãos removidos" >> $GITHUB_STEP_SUMMARY
           echo "- ✅ Cluster EKS **${{ env.CLUSTER_NAME }}** destruído" >> $GITHUB_STEP_SUMMARY
           echo "- ✅ Infraestrutura removida via Terraform" >> $GITHUB_STEP_SUMMARY
