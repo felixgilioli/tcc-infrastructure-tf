@@ -35,57 +35,101 @@ jobs:
         run: terraform init
         working-directory: ./src
 
-      # ========== DESCOBRIR VPC_ID ==========
+      # ========== DESCOBRIR VPC_ID E EKS CLUSTER ==========
 
-      - name: 🔍 Descobrir VPC_ID do Terraform State
-        id: get_vpc
+      - name: 🔍 Descobrir VPC_ID e EKS Cluster do Terraform State
+        id: get_resources
         run: |
-          echo "Buscando VPC_ID do Terraform State..."
+          echo "Buscando recursos do Terraform State..."
           
-          # Listar recursos VPC
+          # Listar recursos
           echo "Listando recursos do state:"
           terraform state list
           
-          # Encontrar o recurso VPC
+          # ===== VPC =====
           VPC_RESOURCE=$(terraform state list | grep -E 'aws_vpc\.' | head -1)
           
           if [ -z "$VPC_RESOURCE" ]; then
-            echo "❌ ERRO: Nenhum recurso aws_vpc encontrado no state"
-            echo "Recursos disponíveis:"
-            terraform state list
-            exit 1
+            echo "⚠️ Nenhum recurso aws_vpc encontrado no state"
+            VPC_ID=""
+          else
+            echo "Recurso VPC encontrado: $VPC_RESOURCE"
+            VPC_ID=$(terraform state show "$VPC_RESOURCE" 2>/dev/null | grep -E '^\s*id\s*=' | head -1 | sed 's/.*=\s*"\(.*\)"/\1/' | tr -d ' ')
+            
+            if [[ ! "$VPC_ID" =~ ^vpc-[a-f0-9]+ ]]; then
+              VPC_ID=$(terraform show -json 2>/dev/null | jq -r '.values.root_module.resources[]? | select(.type=="aws_vpc") | .values.id' | head -1)
+            fi
           fi
           
-          echo "Recurso VPC encontrado: $VPC_RESOURCE"
-          
-          # Extrair VPC_ID do recurso
-          VPC_ID=$(terraform state show "$VPC_RESOURCE" 2>/dev/null | grep -E '^\s*id\s*=' | head -1 | sed 's/.*=\s*"\(.*\)"/\1/' | tr -d ' ')
-          
-          # Validar se é um VPC ID válido (formato: vpc-XXXXXXXXXXXXXXXXX)
-          if [[ ! "$VPC_ID" =~ ^vpc-[a-f0-9]{17}$ ]] && [[ ! "$VPC_ID" =~ ^vpc-[a-f0-9]{8}$ ]]; then
-            echo "❌ ERRO: VPC_ID inválido capturado: '$VPC_ID'"
-            echo "Tentando método alternativo..."
-          
-            # Método alternativo: extrair JSON e pegar o id
-            VPC_ID=$(terraform show -json 2>/dev/null | jq -r '.values.root_module.resources[]? | select(.type=="aws_vpc") | .values.id' | head -1)
-          fi
-          
-          # Validar novamente
-          if [[ ! "$VPC_ID" =~ ^vpc-[a-f0-9]{17}$ ]] && [[ ! "$VPC_ID" =~ ^vpc-[a-f0-9]{8}$ ]]; then
-            echo "❌ ERRO: Não foi possível extrair VPC_ID válido"
-            echo "VPC_ID capturado: '$VPC_ID'"
-            exit 1
-          fi
-          
-          echo "✅ VPC_ID encontrado: $VPC_ID"
           echo "VPC_ID=$VPC_ID" >> $GITHUB_OUTPUT
+          echo "✅ VPC_ID: $VPC_ID"
+          
+          # ===== EKS Cluster =====
+          EKS_RESOURCE=$(terraform state list | grep -E 'aws_eks_cluster\.' | head -1)
+          
+          if [ -z "$EKS_RESOURCE" ]; then
+            echo "⚠️ Nenhum recurso aws_eks_cluster encontrado no state"
+            CLUSTER_NAME=""
+          else
+            echo "Recurso EKS encontrado: $EKS_RESOURCE"
+            CLUSTER_NAME=$(terraform state show "$EKS_RESOURCE" 2>/dev/null | grep -E '^\s*name\s*=' | head -1 | sed 's/.*=\s*"\(.*\)"/\1/' | tr -d ' ')
+          fi
+          
+          echo "CLUSTER_NAME=$CLUSTER_NAME" >> $GITHUB_OUTPUT
+          echo "✅ CLUSTER_NAME: $CLUSTER_NAME"
         working-directory: ./src
+
+      # ========== LIMPEZA DE RECURSOS EKS ==========
+
+      - name: 🔥 0/8 - Deletar Node Groups e Fargate Profiles do EKS
+        if: steps.get_resources.outputs.CLUSTER_NAME != ''
+        run: |
+          CLUSTER_NAME="${{ steps.get_resources.outputs.CLUSTER_NAME }}"
+          echo "Deletando recursos do EKS Cluster: $CLUSTER_NAME"
+          
+          # Deletar Node Groups
+          echo "=== Deletando Node Groups ==="
+          NODE_GROUPS=$(aws eks list-nodegroups --cluster-name $CLUSTER_NAME --query 'nodegroups[*]' --output text 2>/dev/null || echo "")
+          
+          if [ -n "$NODE_GROUPS" ] && [ "$NODE_GROUPS" != "None" ]; then
+            for ng in $NODE_GROUPS; do
+              echo "  ➜ Deletando Node Group: $ng"
+              aws eks delete-nodegroup --cluster-name $CLUSTER_NAME --nodegroup-name $ng 2>/dev/null || true
+            done
+            
+            echo "Aguardando Node Groups serem deletados (pode levar alguns minutos)..."
+            for ng in $NODE_GROUPS; do
+              aws eks wait nodegroup-deleted --cluster-name $CLUSTER_NAME --nodegroup-name $ng 2>/dev/null || true
+            done
+          else
+            echo "✅ Nenhum Node Group encontrado"
+          fi
+          
+          # Deletar Fargate Profiles
+          echo "=== Deletando Fargate Profiles ==="
+          FARGATE_PROFILES=$(aws eks list-fargate-profiles --cluster-name $CLUSTER_NAME --query 'fargateProfileNames[*]' --output text 2>/dev/null || echo "")
+          
+          if [ -n "$FARGATE_PROFILES" ] && [ "$FARGATE_PROFILES" != "None" ]; then
+            for fp in $FARGATE_PROFILES; do
+              echo "  ➜ Deletando Fargate Profile: $fp"
+              aws eks delete-fargate-profile --cluster-name $CLUSTER_NAME --fargate-profile-name $fp 2>/dev/null || true
+            done
+            
+            echo "Aguardando Fargate Profiles serem deletados..."
+            for fp in $FARGATE_PROFILES; do
+              aws eks wait fargate-profile-deleted --cluster-name $CLUSTER_NAME --fargate-profile-name $fp 2>/dev/null || true
+            done
+          else
+            echo "✅ Nenhum Fargate Profile encontrado"
+          fi
+        continue-on-error: true
 
       # ========== LIMPEZA FORÇADA DE RECURSOS AWS ==========
 
       - name: 🔍 Diagnóstico - Listar recursos presos
+        if: steps.get_resources.outputs.VPC_ID != ''
         run: |
-          VPC_ID="${{ steps.get_vpc.outputs.VPC_ID }}"
+          VPC_ID="${{ steps.get_resources.outputs.VPC_ID }}"
           echo "============================================"
           echo "📋 DIAGNÓSTICO DE RECURSOS NA VPC: $VPC_ID"
           echo "============================================"
@@ -93,13 +137,30 @@ jobs:
           echo -e "\n=== Load Balancers ==="
           aws elbv2 describe-load-balancers \
             --query "LoadBalancers[?VpcId=='$VPC_ID'].[LoadBalancerName,LoadBalancerArn,State.Code]" \
-            --output table 2>/dev/null || echo "Nenhum LB encontrado"
+            --output table 2>/dev/null || echo "Nenhum ALB/NLB encontrado"
+          
+          echo -e "\n=== Classic Load Balancers ==="
+          aws elb describe-load-balancers \
+            --query "LoadBalancerDescriptions[?VPCId=='$VPC_ID'].[LoadBalancerName]" \
+            --output table 2>/dev/null || echo "Nenhum CLB encontrado"
           
           echo -e "\n=== NAT Gateways ==="
           aws ec2 describe-nat-gateways \
             --filter "Name=vpc-id,Values=$VPC_ID" \
             --query 'NatGateways[*].[NatGatewayId,State,SubnetId]' \
             --output table 2>/dev/null || echo "Nenhum NAT encontrado"
+          
+          echo -e "\n=== VPC Endpoints ==="
+          aws ec2 describe-vpc-endpoints \
+            --filters "Name=vpc-id,Values=$VPC_ID" \
+            --query 'VpcEndpoints[*].[VpcEndpointId,ServiceName,State]' \
+            --output table 2>/dev/null || echo "Nenhum VPC Endpoint encontrado"
+          
+          echo -e "\n=== Internet Gateways ==="
+          aws ec2 describe-internet-gateways \
+            --filters "Name=attachment.vpc-id,Values=$VPC_ID" \
+            --query 'InternetGateways[*].[InternetGatewayId]' \
+            --output table 2>/dev/null || echo "Nenhum IGW encontrado"
           
           echo -e "\n=== Elastic IPs ==="
           aws ec2 describe-addresses \
@@ -110,38 +171,112 @@ jobs:
           echo -e "\n=== Network Interfaces ==="
           aws ec2 describe-network-interfaces \
             --filters "Name=vpc-id,Values=$VPC_ID" \
-            --query 'NetworkInterfaces[*].[NetworkInterfaceId,Status,Description]' \
+            --query 'NetworkInterfaces[*].[NetworkInterfaceId,Status,InterfaceType,Description]' \
             --output table 2>/dev/null || echo "Nenhum ENI encontrado"
+          
+          echo -e "\n=== Subnets ==="
+          aws ec2 describe-subnets \
+            --filters "Name=vpc-id,Values=$VPC_ID" \
+            --query 'Subnets[*].[SubnetId,CidrBlock,AvailabilityZone]' \
+            --output table 2>/dev/null || echo "Nenhuma Subnet encontrada"
         continue-on-error: true
 
-      - name: 🔥 1/5 - Deletar Load Balancers
+      - name: 🔥 1/8 - Deletar Load Balancers (ALB/NLB)
+        if: steps.get_resources.outputs.VPC_ID != ''
         run: |
-          VPC_ID="${{ steps.get_vpc.outputs.VPC_ID }}"
+          VPC_ID="${{ steps.get_resources.outputs.VPC_ID }}"
           echo "Deletando Load Balancers da VPC $VPC_ID..."
           
+          # ALB/NLB
           LBS=$(aws elbv2 describe-load-balancers \
             --query "LoadBalancers[?VpcId=='$VPC_ID'].LoadBalancerArn" \
             --output text 2>/dev/null || echo "")
           
           if [ -n "$LBS" ] && [ "$LBS" != "None" ]; then
             for lb in $LBS; do
-              echo "  ➜ Deletando LB: $lb"
+              echo "  ➜ Deletando ALB/NLB: $lb"
+              
+              # Primeiro deletar listeners
+              LISTENERS=$(aws elbv2 describe-listeners --load-balancer-arn $lb --query 'Listeners[*].ListenerArn' --output text 2>/dev/null || echo "")
+              for listener in $LISTENERS; do
+                aws elbv2 delete-listener --listener-arn $listener 2>/dev/null || true
+              done
+              
               aws elbv2 delete-load-balancer --load-balancer-arn $lb 2>/dev/null || true
             done
-            echo "✅ Load Balancers deletados. Aguardando 60s..."
+            echo "Aguardando LBs serem deletados (60s)..."
             sleep 60
           else
-            echo "✅ Nenhum Load Balancer encontrado"
+            echo "✅ Nenhum ALB/NLB encontrado"
+          fi
+          
+          # Classic LB
+          CLBS=$(aws elb describe-load-balancers \
+            --query "LoadBalancerDescriptions[?VPCId=='$VPC_ID'].LoadBalancerName" \
+            --output text 2>/dev/null || echo "")
+          
+          if [ -n "$CLBS" ] && [ "$CLBS" != "None" ]; then
+            for clb in $CLBS; do
+              echo "  ➜ Deletando CLB: $clb"
+              aws elb delete-load-balancer --load-balancer-name $clb 2>/dev/null || true
+            done
+            sleep 30
+          else
+            echo "✅ Nenhum Classic LB encontrado"
           fi
         continue-on-error: true
 
-      - name: 🔥 2/5 - Deletar NAT Gateways
+      - name: 🔥 2/8 - Deletar Target Groups
+        if: steps.get_resources.outputs.VPC_ID != ''
         run: |
-          VPC_ID="${{ steps.get_vpc.outputs.VPC_ID }}"
+          VPC_ID="${{ steps.get_resources.outputs.VPC_ID }}"
+          echo "Deletando Target Groups da VPC $VPC_ID..."
+          
+          TGS=$(aws elbv2 describe-target-groups \
+            --query "TargetGroups[?VpcId=='$VPC_ID'].TargetGroupArn" \
+            --output text 2>/dev/null || echo "")
+          
+          if [ -n "$TGS" ] && [ "$TGS" != "None" ]; then
+            for tg in $TGS; do
+              echo "  ➜ Deletando Target Group: $tg"
+              aws elbv2 delete-target-group --target-group-arn $tg 2>/dev/null || true
+            done
+          else
+            echo "✅ Nenhum Target Group encontrado"
+          fi
+        continue-on-error: true
+
+      - name: 🔥 3/8 - Deletar VPC Endpoints
+        if: steps.get_resources.outputs.VPC_ID != ''
+        run: |
+          VPC_ID="${{ steps.get_resources.outputs.VPC_ID }}"
+          echo "Deletando VPC Endpoints da VPC $VPC_ID..."
+          
+          ENDPOINTS=$(aws ec2 describe-vpc-endpoints \
+            --filters "Name=vpc-id,Values=$VPC_ID" \
+            --query 'VpcEndpoints[*].VpcEndpointId' \
+            --output text 2>/dev/null || echo "")
+          
+          if [ -n "$ENDPOINTS" ] && [ "$ENDPOINTS" != "None" ]; then
+            for ep in $ENDPOINTS; do
+              echo "  ➜ Deletando Endpoint: $ep"
+              aws ec2 delete-vpc-endpoints --vpc-endpoint-ids $ep 2>/dev/null || true
+            done
+            echo "Aguardando VPC Endpoints serem deletados (30s)..."
+            sleep 30
+          else
+            echo "✅ Nenhum VPC Endpoint encontrado"
+          fi
+        continue-on-error: true
+
+      - name: 🔥 4/8 - Deletar NAT Gateways
+        if: steps.get_resources.outputs.VPC_ID != ''
+        run: |
+          VPC_ID="${{ steps.get_resources.outputs.VPC_ID }}"
           echo "Deletando NAT Gateways da VPC $VPC_ID..."
           
           NATS=$(aws ec2 describe-nat-gateways \
-            --filter "Name=vpc-id,Values=$VPC_ID" "Name=state,Values=available,pending" \
+            --filter "Name=vpc-id,Values=$VPC_ID" "Name=state,Values=available,pending,deleting" \
             --query 'NatGateways[*].NatGatewayId' \
             --output text 2>/dev/null || echo "")
           
@@ -150,124 +285,293 @@ jobs:
               echo "  ➜ Deletando NAT: $nat"
               aws ec2 delete-nat-gateway --nat-gateway-id $nat 2>/dev/null || true
             done
-            echo "✅ NAT Gateways deletados. Aguardando 120s para liberação completa..."
-            sleep 120
+            
+            echo "Aguardando NAT Gateways serem deletados..."
+            for nat in $NATS; do
+              echo "  ⏳ Aguardando $nat..."
+              aws ec2 wait nat-gateway-deleted --nat-gateway-ids $nat 2>/dev/null || true
+            done
           else
             echo "✅ Nenhum NAT Gateway encontrado"
           fi
         continue-on-error: true
 
-      - name: 🔥 3/5 - Liberar Elastic IPs
+      - name: 🔥 5/8 - Liberar Elastic IPs
         run: |
           echo "Liberando Elastic IPs..."
           
           EIPS=$(aws ec2 describe-addresses \
             --filters "Name=domain,Values=vpc" \
-            --query 'Addresses[*].AllocationId' \
+            --query 'Addresses[?AssociationId==`null` || AssociationId==``].AllocationId' \
             --output text 2>/dev/null || echo "")
           
-          if [ -n "$EIPS" ] && [ "$EIPS" != "None" ]; then
-            for eip in $EIPS; do
-              echo "  ➜ Liberando EIP: $eip"
+          # Também pegar EIPs associados
+          ALL_EIPS=$(aws ec2 describe-addresses \
+            --filters "Name=domain,Values=vpc" \
+            --query 'Addresses[*].[AllocationId,AssociationId]' \
+            --output text 2>/dev/null || echo "")
           
-              # Tenta desassociar primeiro
-              ASSOC_ID=$(aws ec2 describe-addresses \
-                --allocation-ids $eip \
-                --query 'Addresses[0].AssociationId' \
-                --output text 2>/dev/null || echo "")
-          
-              if [ -n "$ASSOC_ID" ] && [ "$ASSOC_ID" != "None" ] && [ "$ASSOC_ID" != "null" ]; then
-                aws ec2 disassociate-address --association-id $ASSOC_ID 2>/dev/null || true
-                sleep 5
+          if [ -n "$ALL_EIPS" ] && [ "$ALL_EIPS" != "None" ]; then
+            echo "$ALL_EIPS" | while read -r alloc assoc; do
+              if [ -n "$alloc" ] && [ "$alloc" != "None" ]; then
+                echo "  ➜ Processando EIP: $alloc"
+                
+                # Desassociar se necessário
+                if [ -n "$assoc" ] && [ "$assoc" != "None" ] && [ "$assoc" != "null" ]; then
+                  echo "    ↳ Desassociando..."
+                  aws ec2 disassociate-address --association-id $assoc 2>/dev/null || true
+                  sleep 5
+                fi
+                
+                # Liberar
+                echo "    ↳ Liberando..."
+                aws ec2 release-address --allocation-id $alloc 2>/dev/null || true
               fi
-          
-              # Depois libera
-              aws ec2 release-address --allocation-id $eip 2>/dev/null || true
             done
-            echo "✅ Elastic IPs liberados"
           else
             echo "✅ Nenhum Elastic IP encontrado"
           fi
         continue-on-error: true
 
-      - name: 🔥 4/5 - Deletar Network Interfaces
+      - name: 🔥 6/8 - Deletar Network Interfaces
+        if: steps.get_resources.outputs.VPC_ID != ''
         run: |
-          VPC_ID="${{ steps.get_vpc.outputs.VPC_ID }}"
+          VPC_ID="${{ steps.get_resources.outputs.VPC_ID }}"
           echo "Deletando Network Interfaces da VPC $VPC_ID..."
           
-          ENIS=$(aws ec2 describe-network-interfaces \
-            --filters "Name=vpc-id,Values=$VPC_ID" \
-            --query 'NetworkInterfaces[*].NetworkInterfaceId' \
-            --output text 2>/dev/null || echo "")
-          
-          if [ -n "$ENIS" ] && [ "$ENIS" != "None" ]; then
-            for eni in $ENIS; do
-              echo "  ➜ Processando ENI: $eni"
-          
-              # Tenta desanexar se estiver anexado
-              ATTACH_ID=$(aws ec2 describe-network-interfaces \
-                --network-interface-ids $eni \
-                --query 'NetworkInterfaces[0].Attachment.AttachmentId' \
-                --output text 2>/dev/null || echo "")
-          
-              if [ -n "$ATTACH_ID" ] && [ "$ATTACH_ID" != "None" ] && [ "$ATTACH_ID" != "null" ]; then
-                echo "    ↳ Desanexando..."
-                aws ec2 detach-network-interface \
-                  --attachment-id $ATTACH_ID \
-                  --force 2>/dev/null || true
-                sleep 5
+          # Loop múltiplas vezes porque alguns ENIs podem ficar presos
+          for attempt in 1 2 3; do
+            echo "=== Tentativa $attempt ==="
+            
+            ENIS=$(aws ec2 describe-network-interfaces \
+              --filters "Name=vpc-id,Values=$VPC_ID" \
+              --query 'NetworkInterfaces[*].[NetworkInterfaceId,Attachment.AttachmentId,Status]' \
+              --output text 2>/dev/null || echo "")
+            
+            if [ -z "$ENIS" ] || [ "$ENIS" == "None" ]; then
+              echo "✅ Nenhum Network Interface restante"
+              break
+            fi
+            
+            echo "$ENIS" | while read -r eni attach status; do
+              if [ -n "$eni" ] && [ "$eni" != "None" ]; then
+                echo "  ➜ Processando ENI: $eni (status: $status)"
+                
+                # Desanexar se necessário
+                if [ -n "$attach" ] && [ "$attach" != "None" ] && [ "$attach" != "null" ]; then
+                  echo "    ↳ Desanexando..."
+                  aws ec2 detach-network-interface --attachment-id $attach --force 2>/dev/null || true
+                  sleep 10
+                fi
+                
+                # Deletar
+                echo "    ↳ Deletando..."
+                aws ec2 delete-network-interface --network-interface-id $eni 2>/dev/null || true
               fi
-          
-              # Deleta o ENI
-              echo "    ↳ Deletando..."
-              aws ec2 delete-network-interface \
-                --network-interface-id $eni 2>/dev/null || true
             done
-            echo "✅ Network Interfaces processados. Aguardando 30s..."
-            sleep 30
-          else
-            echo "✅ Nenhum Network Interface encontrado"
-          fi
+            
+            sleep 15
+          done
         continue-on-error: true
 
-      - name: 🔥 5/5 - Limpeza de Security Groups órfãos
+      - name: 🔥 7/8 - Deletar Security Groups
+        if: steps.get_resources.outputs.VPC_ID != ''
         run: |
-          VPC_ID="${{ steps.get_vpc.outputs.VPC_ID }}"
-          echo "Limpando Security Groups órfãos da VPC $VPC_ID..."
+          VPC_ID="${{ steps.get_resources.outputs.VPC_ID }}"
+          echo "Deletando Security Groups da VPC $VPC_ID..."
           
+          # Primeiro, remover todas as regras de ingress/egress que referenciam outros SGs
           SGS=$(aws ec2 describe-security-groups \
             --filters "Name=vpc-id,Values=$VPC_ID" \
             --query 'SecurityGroups[?GroupName!=`default`].GroupId' \
             --output text 2>/dev/null || echo "")
           
           if [ -n "$SGS" ] && [ "$SGS" != "None" ]; then
+            echo "=== Removendo regras de referência entre SGs ==="
+            for sg in $SGS; do
+              echo "  ➜ Limpando regras do SG: $sg"
+              
+              # Remover regras de ingress
+              INGRESS=$(aws ec2 describe-security-groups --group-ids $sg \
+                --query 'SecurityGroups[0].IpPermissions' --output json 2>/dev/null || echo "[]")
+              if [ "$INGRESS" != "[]" ] && [ "$INGRESS" != "null" ]; then
+                aws ec2 revoke-security-group-ingress --group-id $sg --ip-permissions "$INGRESS" 2>/dev/null || true
+              fi
+              
+              # Remover regras de egress
+              EGRESS=$(aws ec2 describe-security-groups --group-ids $sg \
+                --query 'SecurityGroups[0].IpPermissionsEgress' --output json 2>/dev/null || echo "[]")
+              if [ "$EGRESS" != "[]" ] && [ "$EGRESS" != "null" ]; then
+                aws ec2 revoke-security-group-egress --group-id $sg --ip-permissions "$EGRESS" 2>/dev/null || true
+              fi
+            done
+            
+            sleep 10
+            
+            echo "=== Deletando Security Groups ==="
             for sg in $SGS; do
               echo "  ➜ Deletando SG: $sg"
               aws ec2 delete-security-group --group-id $sg 2>/dev/null || true
             done
+          else
+            echo "✅ Nenhum Security Group customizado encontrado"
+          fi
+        continue-on-error: true
+
+      - name: 🔥 8/8 - Limpar Internet Gateway e Route Tables
+        if: steps.get_resources.outputs.VPC_ID != ''
+        run: |
+          VPC_ID="${{ steps.get_resources.outputs.VPC_ID }}"
+          
+          echo "=== Detachando Internet Gateways ==="
+          IGWS=$(aws ec2 describe-internet-gateways \
+            --filters "Name=attachment.vpc-id,Values=$VPC_ID" \
+            --query 'InternetGateways[*].InternetGatewayId' \
+            --output text 2>/dev/null || echo "")
+          
+          if [ -n "$IGWS" ] && [ "$IGWS" != "None" ]; then
+            for igw in $IGWS; do
+              echo "  ➜ Detachando IGW: $igw"
+              aws ec2 detach-internet-gateway --internet-gateway-id $igw --vpc-id $VPC_ID 2>/dev/null || true
+              echo "  ➜ Deletando IGW: $igw"
+              aws ec2 delete-internet-gateway --internet-gateway-id $igw 2>/dev/null || true
+            done
+          else
+            echo "✅ Nenhum Internet Gateway encontrado"
           fi
           
-          echo "✅ Security Groups processados"
+          echo "=== Deletando Route Tables customizadas ==="
+          RTS=$(aws ec2 describe-route-tables \
+            --filters "Name=vpc-id,Values=$VPC_ID" \
+            --query 'RouteTables[?Associations[?Main==`false`]].RouteTableId' \
+            --output text 2>/dev/null || echo "")
+          
+          if [ -n "$RTS" ] && [ "$RTS" != "None" ]; then
+            for rt in $RTS; do
+              echo "  ➜ Processando RT: $rt"
+              
+              # Desassociar subnets
+              ASSOCS=$(aws ec2 describe-route-tables --route-table-ids $rt \
+                --query 'RouteTables[0].Associations[?!Main].RouteTableAssociationId' \
+                --output text 2>/dev/null || echo "")
+              
+              for assoc in $ASSOCS; do
+                if [ -n "$assoc" ] && [ "$assoc" != "None" ]; then
+                  aws ec2 disassociate-route-table --association-id $assoc 2>/dev/null || true
+                fi
+              done
+              
+              # Deletar route table
+              aws ec2 delete-route-table --route-table-id $rt 2>/dev/null || true
+            done
+          else
+            echo "✅ Nenhuma Route Table customizada encontrada"
+          fi
+          
+          echo "=== Deletando Subnets manualmente (se necessário) ==="
+          SUBNETS=$(aws ec2 describe-subnets \
+            --filters "Name=vpc-id,Values=$VPC_ID" \
+            --query 'Subnets[*].SubnetId' \
+            --output text 2>/dev/null || echo "")
+          
+          if [ -n "$SUBNETS" ] && [ "$SUBNETS" != "None" ]; then
+            for subnet in $SUBNETS; do
+              echo "  ➜ Tentando deletar Subnet: $subnet"
+              aws ec2 delete-subnet --subnet-id $subnet 2>/dev/null || true
+            done
+          fi
         continue-on-error: true
 
       # ========== TERRAFORM DESTROY ==========
 
       - name: 🎯 Terraform Destroy - Tentativa 1
-        run: terraform destroy -parallelism=1 --auto-approve
+        id: destroy1
+        run: |
+          terraform destroy -auto-approve -parallelism=5 2>&1 | tee destroy1.log
+          exit ${PIPESTATUS[0]}
         working-directory: ./src
         continue-on-error: true
 
       - name: ⏳ Aguardar propagação AWS
+        if: steps.destroy1.outcome == 'failure'
         run: |
-          echo "Aguardando 60s para propagação de mudanças na AWS..."
-          sleep 60
+          echo "Primeira tentativa falhou. Aguardando 90s para propagação..."
+          sleep 90
 
-      - name: 🎯 Terraform Destroy - Tentativa 2 (Final)
-        run: terraform destroy -parallelism=1 --auto-approve
+      - name: 🔄 Refresh State e Nova Limpeza
+        if: steps.destroy1.outcome == 'failure'
+        run: |
+          VPC_ID="${{ steps.get_resources.outputs.VPC_ID }}"
+          
+          echo "=== Refresh do Terraform State ==="
+          terraform refresh 2>/dev/null || true
+          
+          if [ -n "$VPC_ID" ]; then
+            echo "=== Limpeza adicional de ENIs ==="
+            ENIS=$(aws ec2 describe-network-interfaces \
+              --filters "Name=vpc-id,Values=$VPC_ID" \
+              --query 'NetworkInterfaces[*].NetworkInterfaceId' \
+              --output text 2>/dev/null || echo "")
+            
+            for eni in $ENIS; do
+              if [ -n "$eni" ] && [ "$eni" != "None" ]; then
+                aws ec2 delete-network-interface --network-interface-id $eni 2>/dev/null || true
+              fi
+            done
+          fi
+        working-directory: ./src
+        continue-on-error: true
+
+      - name: 🎯 Terraform Destroy - Tentativa 2
+        id: destroy2
+        if: steps.destroy1.outcome == 'failure'
+        run: terraform destroy -auto-approve -parallelism=1
+        working-directory: ./src
+        continue-on-error: true
+
+      - name: 🎯 Terraform Destroy - Tentativa 3 (Forçada)
+        if: steps.destroy2.outcome == 'failure'
+        run: |
+          echo "=== Tentativa final com refresh ==="
+          terraform refresh || true
+          terraform destroy -auto-approve -parallelism=1 -refresh=false
         working-directory: ./src
 
-      - name: ✅ Destroy concluído com sucesso
+      - name: ✅ Verificação Final
+        if: always()
         run: |
+          VPC_ID="${{ steps.get_resources.outputs.VPC_ID }}"
+          
           echo "============================================"
-          echo "✅ DESTROY CONCLUÍDO COM SUCESSO!"
+          echo "📋 VERIFICAÇÃO FINAL DE RECURSOS"
+          echo "============================================"
+          
+          if [ -n "$VPC_ID" ]; then
+            echo -e "\n=== Recursos restantes na VPC $VPC_ID ==="
+            
+            REMAINING=$(aws ec2 describe-subnets \
+              --filters "Name=vpc-id,Values=$VPC_ID" \
+              --query 'Subnets[*].SubnetId' \
+              --output text 2>/dev/null || echo "")
+            
+            if [ -n "$REMAINING" ] && [ "$REMAINING" != "None" ]; then
+              echo "⚠️ AVISO: Ainda existem subnets na VPC!"
+              aws ec2 describe-subnets \
+                --filters "Name=vpc-id,Values=$VPC_ID" \
+                --query 'Subnets[*].[SubnetId,CidrBlock]' \
+                --output table
+            else
+              echo "✅ Nenhuma subnet restante"
+            fi
+            
+            VPC_EXISTS=$(aws ec2 describe-vpcs --vpc-ids $VPC_ID 2>/dev/null || echo "")
+            if [ -n "$VPC_EXISTS" ]; then
+              echo "⚠️ VPC $VPC_ID ainda existe"
+            else
+              echo "✅ VPC deletada com sucesso"
+            fi
+          fi
+          
+          echo -e "\n============================================"
+          echo "🏁 PROCESSO DE DESTROY FINALIZADO"
           echo "============================================"
