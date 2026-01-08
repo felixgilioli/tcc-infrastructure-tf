@@ -43,3 +43,17 @@ resource "aws_eks_node_group" "main" {
 
   tags = var.tags
 } 
+
+resource "null_resource" "cleanup_before_destroy" {
+  triggers = {
+    cluster_name = aws_eks_cluster.this.name
+    vpc_id       = var.vpc_id
+  }
+
+  provisioner "local-exec" {
+    when    = destroy
+    command = <<-EOT
+      # Script de limpeza aqui
+    EOT
+  }
+}
